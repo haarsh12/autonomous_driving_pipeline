@@ -1,0 +1,60 @@
+# Reference project
+reference_project/
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Output files
+outputs/
+
+# Model files (heavy)
+models/
+*.pt
+*.pth
+*.onnx
+*.h5
+*.pb
+*.tflite
+*.weights
+
+# Video files (heavy)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.wmv
+*.webm
+
+# Input videos directory
+input video/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment variables
+.env
+.env.local
