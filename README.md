@@ -1,7 +1,4 @@
-\venv\Scripts\python.exe -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --force-reinstall
-Looking in indexes: https://download.pytorch.org/whl/cu121
-Collecting torch
-  Downloading https://download-r2.pytorch.org/whl/cu121/torch-2.5.1%2Bcu121-cp311-cp311-win_amd64.whl (2449.4 MB)
+.\venv\Scripts\python.exe main.py --source "input video/driving_city.mp4" --output "outputs/annotated_driving_city.mp4" --device cuda --show
  
 
 # Autonomous Driving ADAS Perception System
