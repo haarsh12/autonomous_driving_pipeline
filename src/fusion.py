@@ -4,7 +4,7 @@ Fuses object detections with the depth map, computes estimated real-world
 distance (in meters), assigns lane positions, relative speed, TTC, and risk levels.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 import numpy as np
 
@@ -29,7 +29,8 @@ class FusedObject:
     relative_speed_kmh: float = 0.0
     ttc_s: float = float('inf')        # Time-to-Collision in seconds
     lane_position: str = "EGO LANE"    # "EGO LANE", "LEFT LANE", "RIGHT LANE", "OFF-ROAD"
-    risk_level: str = "safe"          # "safe", "caution", "warning", "critical"
+    risk_level: str = "safe"           # "safe", "caution", "warning", "critical"
+    extra: dict = field(default_factory=dict)   # passthrough from Detection (e.g. tl_color)
 
 
 def estimate_focal_length_px(frame_width_px: int, horizontal_fov_deg: float = 70.0) -> float:
@@ -140,6 +141,7 @@ def fuse_detections_with_depth(
             depth_rank=depth_rank_lookup[id(det)],
             smoothed_distance_m=final_distance,
             lane_position=lane,
+            extra=getattr(det, "extra", {}),
         ))
 
     return fused

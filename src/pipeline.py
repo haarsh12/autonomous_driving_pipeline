@@ -20,6 +20,7 @@ from detector import ObjectDetector
 from depth_estimator import DepthEstimator
 from fusion import fuse_detections_with_depth
 from tracker import CentroidIOUTracker
+from lane_detector import LaneDetector
 from visualizer import draw_overlay, generate_warnings, SIDEBAR_WIDTH
 from report_generator import PerceptionReportGenerator
 
@@ -35,16 +36,19 @@ class PerceptionPipeline:
                  detect_every_n_frames: int = 4,
                  imgsz: int = 960,
                  output_dir: str = "outputs"):
-        self.detector   = ObjectDetector(model_path, conf_threshold, device, imgsz=imgsz)
-        self.depth_est  = DepthEstimator(depth_model, device)
-        self.tracker    = CentroidIOUTracker()
-        self.fov_deg    = horizontal_fov_deg
+        self.detector    = ObjectDetector(model_path, conf_threshold, device, imgsz=imgsz)
+        self.depth_est   = DepthEstimator(depth_model, device)
+        self.tracker     = CentroidIOUTracker()
+        self.lane_det    = LaneDetector(smooth_alpha=0.30)
+        self.fov_deg     = horizontal_fov_deg
 
         self.depth_every  = run_depth_every_n_frames
         self.detect_every = max(1, detect_every_n_frames)
 
         self._depth_map        = None
         self._last_detections  = []
+        self._last_lane_overlay = None
+        self._last_lane_data    = {}
         self._frame_count      = 0
         self.report_gen        = PerceptionReportGenerator(output_dir=output_dir)
 
@@ -62,7 +66,13 @@ class PerceptionPipeline:
         if self._depth_map is None or self._frame_count % self.depth_every == 0:
             self._depth_map = self.depth_est.estimate(frame)
 
-        # 3. Fusion & Tracking
+        # 3. Lane detection with vehicle occlusion masking
+        vehicle_boxes = [d.box for d in detections if d.class_name in ("car", "truck", "bus", "rickshaw", "motorcycle")]
+        lane_overlay, lane_data = self.lane_det.detect(frame, vehicle_boxes=vehicle_boxes)
+        self._last_lane_overlay = lane_overlay
+        self._last_lane_data    = lane_data
+
+        # 4. Fusion & Tracking
         fused = fuse_detections_with_depth(
             detections, self._depth_map,
             frame.shape[1], self.fov_deg,
@@ -78,7 +88,9 @@ class PerceptionPipeline:
         annotated = draw_overlay(
             frame.copy(), fused, self.tracker,
             fps=fps, frame_idx=frame_idx, total_frames=total_frames,
-            event_log=self.report_gen.events
+            event_log=self.report_gen.events,
+            lane_overlay=lane_overlay,
+            lane_data=lane_data,
         )
         return annotated, fused, warnings
 
@@ -110,10 +122,9 @@ class PerceptionPipeline:
         frame_skip = max(1, int(frame_skip))
         target_spf = 1.0 / fps_in      # seconds between display frames at source speed
 
-        # Display at 75% of original size so cv2.imshow renders faster
-        DISPLAY_SCALE = 0.75
-        disp_w = int((width + SIDEBAR_WIDTH) * DISPLAY_SCALE)
-        disp_h = int(height * DISPLAY_SCALE)
+        # Show at FULL resolution — no scale degradation
+        disp_w = width + SIDEBAR_WIDTH
+        disp_h = height
 
         # Queues: bounded so reader never runs too far ahead of inference
         raw_q  = queue.Queue(maxsize=16)   # raw frames waiting for GPU
@@ -201,10 +212,8 @@ class PerceptionPipeline:
                     if remaining > 0.002:          # only sleep if > 2 ms
                         time.sleep(remaining)
 
-                    # Resize for faster rendering (75% of full canvas)
-                    display_frame = cv2.resize(annotated, (disp_w, disp_h),
-                                               interpolation=cv2.INTER_LINEAR)
-                    cv2.imshow("ADAS Perception", display_frame)
+                    # Display at full native resolution — no scale degradation
+                    cv2.imshow("ADAS Perception", annotated)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         stop.set()
                         break

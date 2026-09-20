@@ -107,7 +107,9 @@ def _hr(canvas, x1, x2, y, color=C_BORDER):
 def draw_overlay(frame, objects: List[FusedObject], tracker=None,
                  fps: Optional[float] = None,
                  frame_idx: int = 0, total_frames: int = 0,
-                 event_log: Optional[List[Dict[str, Any]]] = None):
+                 event_log: Optional[List[Dict[str, Any]]] = None,
+                 lane_overlay: Optional[np.ndarray] = None,
+                 lane_data:    Optional[dict] = None):
     """
     Render the autonomous perception dashboard.
     Returns annotated canvas (H x W+SIDEBAR_WIDTH x 3).
@@ -135,12 +137,24 @@ def draw_overlay(frame, objects: List[FusedObject], tracker=None,
         if obj.ttc_s < min_ttc_s:
             min_ttc_s = obj.ttc_s
 
-    # 1. ANNOTATE VIDEO PANE
+    # ── 0. BLEND LANE OVERLAY ────────────────────────────────────────────────
     video = frame.copy()
+    if lane_overlay is not None and lane_overlay.shape[:2] == (H, W):
+        # Semi-transparent blend: 0.55 original + 0.45 lane overlay
+        cv2.addWeighted(lane_overlay, 0.45, video, 0.55, 0, dst=video)
+
     drawn_pills = []
 
     # Sort objects by distance (farthest first) so closer objects get primary label positioning
     sorted_objs = sorted(objects, key=lambda o: -o.distance_m)
+
+    # Traffic light colour → BGR badge colour map
+    _TL_COLOR_BGR = {
+        "RED":     (0, 0, 220),
+        "YELLOW":  (0, 220, 220),
+        "GREEN":   (0, 200, 40),
+        "UNKNOWN": (120, 120, 120),
+    }
 
     for obj in sorted_objs:
         x1, y1, x2, y2 = [int(v) for v in obj.box]
@@ -161,9 +175,32 @@ def draw_overlay(frame, objects: List[FusedObject], tracker=None,
         arrow = "^" if status == "approaching" else ("v" if status == "receding" else "*")
         _pt(video, arrow, (cx_box-5, y2+15), FONT, 0.5, color, 2)
 
-        id_str = f"ID{obj.track_id} " if obj.track_id else ""
+        # ── Traffic light colour badge ─────────────────────────────────────
+        tl_color_str = None
+        if obj.class_name == "traffic_light":
+            extra = getattr(obj, "extra", {})
+            if not extra:
+                # try detection extra stored on fused obj
+                extra = getattr(obj, "_det_extra", {})
+            tl_color_str = extra.get("tl_color", "UNKNOWN")
+            badge_bgr = _TL_COLOR_BGR.get(tl_color_str, (120, 120, 120))
+            # Draw a filled circle on top of the box to show signal color
+            circle_r = max(7, min(16, (x2-x1)//3))
+            cx_c = (x1 + x2) // 2
+            cy_c = y1 + circle_r + 4
+            cv2.circle(video, (cx_c, cy_c), circle_r, badge_bgr, -1)
+            cv2.circle(video, (cx_c, cy_c), circle_r, C_WHITE, 1)
+            # Override color of bracket/label to match signal
+            color = badge_bgr
+
+        id_str  = f"ID{obj.track_id} " if obj.track_id else ""
         cls_str = obj.class_name.upper().replace("_", " ")
-        label = f"{id_str}{cls_str} | {obj.distance_m:.1f}m"
+        dist_str = f"{obj.distance_m:.1f}m"
+
+        if tl_color_str and tl_color_str != "UNKNOWN":
+            label = f"{id_str}{cls_str} {tl_color_str} | {dist_str}"
+        else:
+            label = f"{id_str}{cls_str} | {dist_str}"
 
         (lw, lh), _ = cv2.getTextSize(label, FONT, 0.45, 1)
         lpad = 4
@@ -193,6 +230,14 @@ def draw_overlay(frame, objects: List[FusedObject], tracker=None,
         cv2.rectangle(video, (pill_rect[0], pill_rect[1]), (pill_rect[2], pill_rect[3]), color, 1)
         _pt(video, label, (pill_rect[0] + lpad, pill_rect[1] + lh + lpad - 1), FONT, 0.45, color, 1)
 
+    # ── Lane status badge (bottom-left of video pane) ─────────────────────────
+    if lane_data:
+        ld = lane_data.get("left_detected", False)
+        rd = lane_data.get("right_detected", False)
+        lane_status = "LANE: L+R" if (ld and rd) else ("LANE: L only" if ld else ("LANE: R only" if rd else "LANE: --"))
+        lane_col    = C_SAFE if (ld and rd) else C_CAUTION
+        _pt(video, lane_status, (8, H - 36), FONT, 0.45, lane_col, 1)
+
     # Top-left warning banners
     warnings = generate_warnings(objects, tracker)
     wy = 32
@@ -210,8 +255,8 @@ def draw_overlay(frame, objects: List[FusedObject], tracker=None,
     # Bottom status strip
     strip_h = 28
     cv2.rectangle(video, (0, H-strip_h), (W, H), (0, 0, 0), -1)
-    fps_label = f"FPS: {fps:.1f}" if fps else "FPS: --"
-    time_label = f"{datetime.datetime.now().strftime('%H:%M:%S')}"
+    fps_label   = f"FPS: {fps:.1f}" if fps else "FPS: --"
+    time_label  = f"{datetime.datetime.now().strftime('%H:%M:%S')}"
     frame_label = f"Frame {frame_idx}/{total_frames}" if total_frames else f"Frame {frame_idx}"
     _pt(video, fps_label, (10, H-10), FONT, 0.40, C_ACCENT, 1)
     _pt(video, time_label, (90, H-10), FONT, 0.40, C_TEXT_MID, 1)
