@@ -1,298 +1,410 @@
-"""
-lane_detector.py
-Bird's Eye View (BEV / IPM) Ground-Anchored 2nd-Degree Polynomial Lane Detector.
+"""Image-space, ground-aligned lane-marking detector.
 
-Key Features:
-  1. Inverse Perspective Mapping (IPM / BEV Warp): Transforms camera perspective
-     into flat Bird's-Eye View ground space.
-  2. Ground Plane Anchoring: All polynomial curves and filled drivable corridors
-     are calculated in BEV ground space and unwarped back onto the road, ensuring
-     they sit FLAT on the asphalt (never balloon into the air or sidewalks).
-  3. Parallel Lane Enforcement: Forces left & right lanes to maintain a constant,
-     realistic lane width (~3.7m in BEV space), overriding false curb detections.
-  4. Bounded Distance: Extends only to the actual visible range of detected lane markings.
-  5. Occlusion Masking: Vehicle bounding boxes are masked out before edge extraction.
+The previous implementation projected every frame through one fixed bird's-eye
+trapezoid and then filled that trapezoid. A fixed calibration is not valid for
+all camera positions, bends, or road widths, so a weak edge response could turn
+into a large synthetic lane that was visibly detached from the road.
+
+This detector only draws a corridor after it has found a geometrically valid
+left/right pair of *image-space* lane-marking candidates. The boundary points
+therefore lie on the source frame's road markings. A short temporal hold keeps
+the display stable through an occlusion, but there is intentionally no made-up
+fallback corridor when a lane has never been detected.
 """
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from typing import Optional, Tuple, List, Dict, Any
+
+
+@dataclass
+class _LineCandidate:
+    """A lane-line candidate in ``x = slope * y + intercept`` form."""
+
+    slope: float
+    intercept: float
+    score: float
+    support: float
+    min_y: float
+    max_y: float
+
+    def x_at(self, y: float) -> float:
+        return self.slope * y + self.intercept
 
 
 class LaneDetector:
-    """
-    BEV (Inverse Perspective Mapping) Ground-Anchored Lane Detector.
-    Guarantees flat ground projection, parallel lane width, and bounded distance.
-    """
+    """Detect an ego-lane corridor from visible road markings."""
 
-    def __init__(self, smooth_alpha: float = 0.25):
-        self.alpha = smooth_alpha
+    def __init__(self, smooth_alpha: float = 0.30, hold_frames: int = 10):
+        self.alpha = float(np.clip(smooth_alpha, 0.05, 1.0))
+        self.hold_frames = max(0, int(hold_frames))
 
-        # Smoothed polynomial coefficients in BEV space: x_bev = A*y_bev^2 + B*y_bev + C
-        self._left_fit_bev  = None
-        self._right_fit_bev = None
+        # Normalised coefficients let one detector survive a resolution change.
+        self._left_line_norm: Optional[Tuple[float, float]] = None
+        self._right_line_norm: Optional[Tuple[float, float]] = None
+        self._missed_frames = 0
 
-        # BEV dimensions
-        self.bev_w = 480
-        self.bev_h = 640
+    # ------------------------------------------------------------------
+    # Feature extraction
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _road_roi(height: int, width: int) -> np.ndarray:
+        """Return a conservative trapezoid covering the road ahead."""
+        return np.array(
+            [
+                (int(width * 0.27), int(height * 0.53)),
+                (int(width * 0.73), int(height * 0.53)),
+                (width - 1, height - 1),
+                (0, height - 1),
+            ],
+            dtype=np.int32,
+        )
 
-        # Smoothed top extent in BEV space (0 = farthest top, bev_h = hood bottom)
-        self._y_top_bev_smooth = float(self.bev_h * 0.35)
-
-    def _get_ipm_matrices(self, H: int, W: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute Perspective Transform matrices M (camera -> BEV) and M_inv (BEV -> camera)."""
-        # Ground ROI trapezoid in camera view
-        src = np.float32([
-            [W * 0.42, H * 0.62],   # Top-Left (horizon)
-            [W * 0.58, H * 0.62],   # Top-Right (horizon)
-            [W * 0.90, H * 0.95],   # Bottom-Right (hood)
-            [W * 0.10, H * 0.95],   # Bottom-Left (hood)
-        ])
-
-        # Rectangle in BEV space
-        dst = np.float32([
-            [self.bev_w * 0.25, 0],
-            [self.bev_w * 0.75, 0],
-            [self.bev_w * 0.75, self.bev_h],
-            [self.bev_w * 0.25, self.bev_h],
-        ])
-
-        M     = cv2.getPerspectiveTransform(src, dst)
-        M_inv = cv2.getPerspectiveTransform(dst, src)
-        return M, M_inv
-
-    def _extract_bev_edge_mask(
-        self, frame_bgr: np.ndarray, M: np.ndarray, vehicle_boxes: List[tuple] = None
-    ) -> np.ndarray:
-        """Extract road lane edges and warp into BEV space."""
-        H, W = frame_bgr.shape[:2]
-
-        # 1. Color filtering in HSV
+    def _lane_feature_mask(
+        self, frame_bgr: np.ndarray, vehicle_boxes: Optional[List[tuple]]
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return edge/color features and a stricter painted-marking mask."""
+        height, width = frame_bgr.shape[:2]
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
-        # White lane mask
-        lower_white = np.array([0, 0, 185], dtype=np.uint8)
-        upper_white = np.array([180, 50, 255], dtype=np.uint8)
-        mask_white  = cv2.inRange(hsv, lower_white, upper_white)
+        # White and yellow are the usual lane-marking colours. The white range
+        # allows shadowed paint while excluding most saturated vehicle colours.
+        white = cv2.inRange(
+            hsv,
+            np.array([0, 0, 135], dtype=np.uint8),
+            np.array([180, 105, 255], dtype=np.uint8),
+        )
+        yellow = cv2.inRange(
+            hsv,
+            np.array([10, 38, 55], dtype=np.uint8),
+            np.array([48, 255, 255], dtype=np.uint8),
+        )
+        painted = cv2.bitwise_or(white, yellow)
 
-        # Yellow lane mask (center line)
-        lower_yellow = np.array([14, 70, 110], dtype=np.uint8)
-        upper_yellow = np.array([38, 255, 255], dtype=np.uint8)
-        mask_yellow  = cv2.inRange(hsv, lower_yellow, upper_yellow)
-
-        color_mask = cv2.bitwise_or(mask_white, mask_yellow)
-
-        # 2. Grayscale Canny
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-        blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
-        edges = cv2.Canny(blurred, 40, 120)
+        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(gray, 35, 100)
+        # Hough voting stays edge-only.  Adding every bright colour pixel here
+        # overwhelms short dashed markings with textured paint, shadows, and
+        # vehicle reflections; colour is used later as a support score instead.
+        features = edges
 
-        combined = cv2.bitwise_or(edges, color_mask)
+        roi_mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillPoly(roi_mask, [self._road_roi(height, width)], 255)
+        features = cv2.bitwise_and(features, roi_mask)
+        painted = cv2.bitwise_and(painted, roi_mask)
 
-        # 3. Mask out vehicle bounding boxes before warping
+        # A car grille, tyre edge, or bumper is a very strong false lane cue.
+        # Removing an expanded box is safer than letting it bend the lane fit.
         if vehicle_boxes:
             for box in vehicle_boxes:
-                vx1, vy1, vx2, vy2 = [int(v) for v in box]
-                vx1, vy1 = max(0, vx1 - 5), max(0, vy1 - 5)
-                vx2, vy2 = min(W - 1, vx2 + 5), min(H - 1, vy2 + 5)
-                combined[vy1:vy2, vx1:vx2] = 0
+                x1, y1, x2, y2 = (int(v) for v in box)
+                pad_x = max(6, int((x2 - x1) * 0.08))
+                pad_y = max(5, int((y2 - y1) * 0.06))
+                x1 = max(0, x1 - pad_x)
+                y1 = max(0, y1 - pad_y)
+                x2 = min(width - 1, x2 + pad_x)
+                y2 = min(height - 1, y2 + pad_y)
+                cv2.rectangle(features, (x1, y1), (x2, y2), 0, -1)
+                cv2.rectangle(painted, (x1, y1), (x2, y2), 0, -1)
 
-        # 4. Warp into BEV (Bird's Eye View)
-        bev_binary = cv2.warpPerspective(combined, M, (self.bev_w, self.bev_h), flags=cv2.INTER_NEAREST)
-        return bev_binary
+        return features, painted
 
-    def _fit_bev_polynomials(
-        self, bev_binary: np.ndarray
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], int]:
-        """
-        Fits 2nd-degree polynomial x_bev = A*y^2 + B*y + C in BEV space using histogram sliding windows.
-        Enforces parallel lane width constraint in BEV space.
-        """
-        # Find non-zero pixels
-        nonzero = bev_binary.nonzero()
-        nonzeroy = np.array(nonzero[0])
-        nonzerox = np.array(nonzero[1])
+    # ------------------------------------------------------------------
+    # Candidate fitting and validation
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _sample_support(mask: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> float:
+        """Measure how much of a Hough segment sits on painted road pixels."""
+        steps = max(12, int(np.hypot(x2 - x1, y2 - y1) / 4))
+        xs = np.clip(np.linspace(x1, x2, steps).round().astype(np.int32), 0, mask.shape[1] - 1)
+        ys = np.clip(np.linspace(y1, y2, steps).round().astype(np.int32), 0, mask.shape[0] - 1)
+        return float(np.count_nonzero(mask[ys, xs]) / steps)
 
-        if len(nonzeroy) < 40:
-            return None, None, int(self.bev_h * 0.35)
+    @staticmethod
+    def _dedupe_candidates(candidates: List[_LineCandidate], width: int) -> List[_LineCandidate]:
+        """Keep one representative for repeated Hough fragments of one line."""
+        selected: List[_LineCandidate] = []
+        for candidate in sorted(candidates, key=lambda c: c.score, reverse=True):
+            duplicate = any(
+                abs(candidate.slope - kept.slope) < 0.16
+                and abs(candidate.intercept - kept.intercept) < width * 0.07
+                for kept in selected
+            )
+            if not duplicate:
+                selected.append(candidate)
+            if len(selected) == 24:
+                break
+        return selected
 
-        # Highest detected lane pixel in BEV (smallest y_bev)
-        min_y_bev = int(np.min(nonzeroy))
+    def _find_candidates(
+        self, features: np.ndarray, painted: np.ndarray
+    ) -> Tuple[List[_LineCandidate], List[_LineCandidate]]:
+        """Find plausible left and right marking segments in the lower road ROI."""
+        height, width = features.shape[:2]
+        lines = cv2.HoughLinesP(
+            features,
+            rho=1,
+            theta=np.pi / 180,
+            threshold=12,
+            minLineLength=max(12, int(width * 0.010)),
+            maxLineGap=max(20, int(width * 0.019)),
+        )
+        if lines is None:
+            return [], []
 
-        # Histogram of bottom half in BEV space
-        bottom_half = bev_binary[int(self.bev_h * 0.5):, :]
-        histogram = np.sum(bottom_half, axis=0)
+        # Dilating by a few pixels lets either edge of a painted stripe receive
+        # credit for the nearby white/yellow paint.
+        paint_support = cv2.dilate(painted, np.ones((5, 5), dtype=np.uint8))
+        left: List[_LineCandidate] = []
+        right: List[_LineCandidate] = []
+        y_base = height * 0.96
+        y_reference = height * 0.58
 
-        midpoint = int(self.bev_w // 2)
-        leftx_base  = np.argmax(histogram[:midpoint])
-        rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+        for x1, y1, x2, y2 in lines.reshape(-1, 4):
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            dy = y2 - y1
+            if abs(dy) < 4:
+                continue
 
-        # Default BEV lane width in pixels (~240px out of 480px width)
-        EXPECTED_LANE_WIDTH_BEV = int(self.bev_w * 0.48)
+            slope = (x2 - x1) / float(dy)  # dx / dy, not dy / dx
+            if not 0.12 <= abs(slope) <= 2.5:
+                continue
 
-        # Sliding window tracking in BEV space
-        nwindows = 9
-        window_height = int(self.bev_h // nwindows)
+            min_y, max_y = min(y1, y2), max(y1, y2)
+            # Keep evidence on the road close to the vehicle. This rejects
+            # building edges and traffic-light supports above the asphalt.
+            if min_y < height * 0.60 or max_y < height * 0.75:
+                continue
 
-        leftx_current  = leftx_base  if histogram[leftx_base] > 10 else int(midpoint - EXPECTED_LANE_WIDTH_BEV / 2)
-        rightx_current = rightx_base if histogram[rightx_base] > 10 else int(midpoint + EXPECTED_LANE_WIDTH_BEV / 2)
+            intercept = x1 - slope * y1
+            x_base = slope * y_base + intercept
+            x_reference = slope * y_reference + intercept
+            if not (width * 0.33 <= x_reference <= width * 0.67):
+                continue
+            if not (-width * 0.15 <= x_base <= width * 1.15):
+                continue
 
-        margin = 40
-        minpix = 15
+            length = float(np.hypot(x2 - x1, y2 - y1))
+            support = self._sample_support(paint_support, x1, y1, x2, y2)
+            score = length * (0.45 + 1.55 * support) * (0.65 + 0.35 * (max_y / height))
+            candidate = _LineCandidate(slope, intercept, score, support, min_y, max_y)
 
-        left_lane_inds  = []
-        right_lane_inds = []
+            if slope < -0.12 and x_base < width * 0.62:
+                left.append(candidate)
+            elif slope > 0.12 and x_base > width * 0.38:
+                right.append(candidate)
 
-        for window in range(nwindows):
-            win_y_low  = self.bev_h - (window + 1) * window_height
-            win_y_high = self.bev_h - window * window_height
+        return self._dedupe_candidates(left, width), self._dedupe_candidates(right, width)
 
-            win_xleft_low   = leftx_current - margin
-            win_xleft_high  = leftx_current + margin
-            win_xright_low  = rightx_current - margin
-            win_xright_high = rightx_current + margin
+    @staticmethod
+    def _line_pair(
+        left: _LineCandidate, right: _LineCandidate, height: int, width: int
+    ) -> Optional[Dict[str, float]]:
+        """Validate a left/right pair as one ego-lane corridor."""
+        denom = right.slope - left.slope
+        if denom <= 1e-6:
+            return None
 
-            good_left_inds = (
-                (nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
-                (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)
-            ).nonzero()[0]
+        y_vanish = (left.intercept - right.intercept) / denom
+        x_vanish = left.x_at(y_vanish)
+        y_base = height * 0.96
+        left_base = left.x_at(y_base)
+        right_base = right.x_at(y_base)
+        lane_width = right_base - left_base
+        lane_center = (left_base + right_base) / 2.0
 
-            good_right_inds = (
-                (nonzeroy >= win_y_low) & (nonzeroy < win_y_high) &
-                (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)
-            ).nonzero()[0]
+        # The road's vanishing point must be inside the lower road area. A
+        # higher intersection usually comes from building edges or a vehicle
+        # silhouette rather than a marking painted on the ground.
+        if not (height * 0.58 <= y_vanish <= height * 0.82):
+            return None
+        if not (width * 0.40 <= x_vanish <= width * 0.60):
+            return None
+        if not (width * 0.18 <= lane_width <= width * 0.60):
+            return None
+        if not (width * 0.34 <= lane_center <= width * 0.66):
+            return None
 
-            left_lane_inds.append(good_left_inds)
-            right_lane_inds.append(good_right_inds)
+        # A normal camera lane in this project is ~35–40% of the image at the
+        # lower ROI. This is a soft score, not a hard calibration assumption.
+        width_score = float(np.exp(-abs(lane_width / width - 0.37) / 0.18))
+        center_score = float(np.exp(-abs(lane_center / width - 0.50) / 0.14))
+        vanishing_score = float(np.exp(-abs(x_vanish / width - 0.50) / 0.14))
+        confidence = min(1.0, (left.support + right.support) / 1.25)
+        score = (left.score + right.score) * (0.35 + 0.65 * width_score * center_score * vanishing_score)
 
-            if len(good_left_inds) > minpix:
-                leftx_current = int(np.mean(nonzerox[good_left_inds]))
-            if len(good_right_inds) > minpix:
-                rightx_current = int(np.mean(nonzerox[good_right_inds]))
-
-        left_lane_inds  = np.concatenate(left_lane_inds) if len(left_lane_inds) > 0 else np.array([], dtype=int)
-        right_lane_inds = np.concatenate(right_lane_inds) if len(right_lane_inds) > 0 else np.array([], dtype=int)
-
-        leftx, lefty = nonzerox[left_lane_inds], nonzeroy[left_lane_inds]
-        rightx, righty = nonzerox[right_lane_inds], nonzeroy[right_lane_inds]
-
-        left_fit, right_fit = None, None
-
-        if len(lefty) > 25:
-            try:
-                left_fit = np.polyfit(lefty, leftx, 2)
-            except (np.linalg.LinAlgError, ValueError):
-                left_fit = None
-
-        if len(righty) > 25:
-            try:
-                right_fit = np.polyfit(righty, rightx, 2)
-            except (np.linalg.LinAlgError, ValueError):
-                right_fit = None
-
-        # Enforce parallel lane width constraint in BEV space:
-        # If one lane is missing/weak or misdetected, generate it parallel to the valid lane!
-        if left_fit is not None and right_fit is None:
-            # Shift left fit to the right by expected lane width
-            right_fit = left_fit.copy()
-            right_fit[2] += EXPECTED_LANE_WIDTH_BEV
-        elif right_fit is not None and left_fit is None:
-            # Shift right fit to the left by expected lane width
-            left_fit = right_fit.copy()
-            left_fit[2] -= EXPECTED_LANE_WIDTH_BEV
-
-        return left_fit, right_fit, min_y_bev
-
-    def detect(
-        self, frame_bgr: np.ndarray, vehicle_boxes: List[tuple] = None
-    ) -> Tuple[np.ndarray, dict]:
-        """
-        Runs BEV ground-anchored lane detection and returns camera overlay + lane_data.
-        """
-        H, W = frame_bgr.shape[:2]
-        M, M_inv = self._get_ipm_matrices(H, W)
-
-        # 1. Extract BEV edge mask
-        bev_binary = self._extract_bev_edge_mask(frame_bgr, M, vehicle_boxes)
-
-        # 2. Fit 2nd-degree BEV polynomials
-        left_fit_cur, right_fit_cur, min_y_bev = self._fit_bev_polynomials(bev_binary)
-
-        # Smooth bounded top extent in BEV space (stop where lane marks end)
-        detected_top_bev = max(int(self.bev_h * 0.25), min_y_bev)
-        self._y_top_bev_smooth = self._y_top_bev_smooth * (1 - self.alpha) + detected_top_bev * self.alpha
-        top_y_bev = int(self._y_top_bev_smooth)
-
-        # 3. Smooth BEV polynomial coefficients via EMA
-        if left_fit_cur is not None:
-            if self._left_fit_bev is None:
-                self._left_fit_bev = left_fit_cur
-            else:
-                self._left_fit_bev = self._left_fit_bev * (1 - self.alpha) + left_fit_cur * self.alpha
-
-        if right_fit_cur is not None:
-            if self._right_fit_bev is None:
-                self._right_fit_bev = right_fit_cur
-            else:
-                self._right_fit_bev = self._right_fit_bev * (1 - self.alpha) + right_fit_cur * self.alpha
-
-        # Synthetic fallback if uninitialized
-        if self._left_fit_bev is None and self._right_fit_bev is None:
-            # Vertical parallel lines in BEV space
-            self._left_fit_bev  = np.array([0.0, 0.0, float(self.bev_w * 0.26)])
-            self._right_fit_bev = np.array([0.0, 0.0, float(self.bev_w * 0.74)])
-
-        # 4. Generate smooth curves in BEV space from hood bottom down to bounded top_y_bev
-        ploty_bev = np.linspace(top_y_bev, self.bev_h - 1, num=30)
-
-        a_l, b_l, c_l = self._left_fit_bev
-        left_x_bev  = a_l * (ploty_bev ** 2) + b_l * ploty_bev + c_l
-
-        a_r, b_r, c_r = self._right_fit_bev
-        right_x_bev = a_r * (ploty_bev ** 2) + b_r * ploty_bev + c_r
-
-        pts_left_bev  = np.array([np.transpose(np.vstack([left_x_bev, ploty_bev]))], dtype=np.float32)
-        pts_right_bev = np.array([np.transpose(np.vstack([right_x_bev, ploty_bev]))], dtype=np.float32)
-
-        # 5. Build ground corridor polygon in BEV space
-        pts_left_bev_arr  = pts_left_bev[0]
-        pts_right_bev_arr = pts_right_bev[0]
-
-        bev_corridor_poly = np.vstack([pts_left_bev_arr, np.flipud(pts_right_bev_arr)])
-
-        # 6. UNWARP BEV POINTS BACK TO ORIGINAL CAMERA PERSPECTIVE GROUND VIEW using M_inv!
-        bev_canvas = np.zeros((self.bev_h, self.bev_w, 3), dtype=np.uint8)
-
-        # Draw filled corridor in BEV space
-        cv2.fillPoly(bev_canvas, [np.int32(bev_corridor_poly)], (0, 150, 40))
-
-        # Draw left and right curves in BEV space
-        cv2.polylines(bev_canvas, [np.int32(pts_left_bev_arr)], isClosed=False, color=(255, 200, 0), thickness=6)
-        cv2.polylines(bev_canvas, [np.int32(pts_right_bev_arr)], isClosed=False, color=(255, 200, 0), thickness=6)
-
-        # Unwarp the entire BEV canvas back onto the camera frame image plane!
-        camera_overlay = cv2.warpPerspective(bev_canvas, M_inv, (W, H), flags=cv2.INTER_LINEAR)
-
-        # Compute camera endpoint coordinates for API compatibility
-        left_pts_cam  = cv2.perspectiveTransform(pts_left_bev, M_inv)[0]
-        right_pts_cam = cv2.perspectiveTransform(pts_right_bev, M_inv)[0]
-
-        left_endpoints  = (tuple(np.int32(left_pts_cam[-1])), tuple(np.int32(left_pts_cam[0])))
-        right_endpoints = (tuple(np.int32(right_pts_cam[-1])), tuple(np.int32(right_pts_cam[0])))
-
-        lane_data = {
-            "left_pts": left_endpoints,
-            "right_pts": right_endpoints,
-            "vanishing_pt": (
-                int((left_pts_cam[0][0] + right_pts_cam[0][0]) / 2),
-                int((left_pts_cam[0][1] + right_pts_cam[0][1]) / 2)
-            ),
-            "corridor_polygon": None,
-            "left_detected": left_fit_cur is not None,
-            "right_detected": right_fit_cur is not None,
-            "top_y": int(left_pts_cam[0][1]),
+        return {
+            "score": score,
+            "confidence": confidence,
+            "x_vanish": x_vanish,
+            "y_vanish": y_vanish,
+            "lane_width": lane_width,
+            "left_base": left_base,
+            "right_base": right_base,
         }
 
-        return camera_overlay, lane_data
+    def _best_pair(
+        self, left: List[_LineCandidate], right: List[_LineCandidate], height: int, width: int
+    ) -> Optional[Tuple[_LineCandidate, _LineCandidate, Dict[str, float]]]:
+        best = None
+        best_score = -1.0
+        previous = self._previous_lines(height, width)
+        for left_line in left:
+            for right_line in right:
+                pair = self._line_pair(left_line, right_line, height, width)
+                if pair is None:
+                    continue
+                score = pair["score"]
+                if previous is not None:
+                    prev_left, prev_right = previous
+                    base_delta = (
+                        abs(left_line.x_at(height * 0.96) - prev_left.x_at(height * 0.96))
+                        + abs(right_line.x_at(height * 0.96) - prev_right.x_at(height * 0.96))
+                    ) / (2.0 * width)
+                    score *= 0.55 + 0.45 * float(np.exp(-base_delta / 0.16))
+                if score > best_score:
+                    best_score = score
+                    best = (left_line, right_line, pair)
+        return best
+
+    # ------------------------------------------------------------------
+    # Temporal state
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalise_line(line: _LineCandidate, height: int, width: int) -> Tuple[float, float]:
+        return line.slope * height / width, line.intercept / width
+
+    @staticmethod
+    def _denormalise_line(line_norm: Tuple[float, float], height: int, width: int) -> _LineCandidate:
+        slope_norm, intercept_norm = line_norm
+        return _LineCandidate(
+            slope=slope_norm * width / height,
+            intercept=intercept_norm * width,
+            score=0.0,
+            support=0.0,
+            min_y=height * 0.5,
+            max_y=height,
+        )
+
+    def _previous_lines(self, height: int, width: int) -> Optional[Tuple[_LineCandidate, _LineCandidate]]:
+        if self._left_line_norm is None or self._right_line_norm is None:
+            return None
+        return (
+            self._denormalise_line(self._left_line_norm, height, width),
+            self._denormalise_line(self._right_line_norm, height, width),
+        )
+
+    def _store_pair(self, left: _LineCandidate, right: _LineCandidate, height: int, width: int) -> None:
+        left_norm = np.array(self._normalise_line(left, height, width), dtype=np.float64)
+        right_norm = np.array(self._normalise_line(right, height, width), dtype=np.float64)
+        if self._left_line_norm is not None:
+            left_norm = (1.0 - self.alpha) * np.array(self._left_line_norm) + self.alpha * left_norm
+        if self._right_line_norm is not None:
+            right_norm = (1.0 - self.alpha) * np.array(self._right_line_norm) + self.alpha * right_norm
+        self._left_line_norm = tuple(left_norm)
+        self._right_line_norm = tuple(right_norm)
+        self._missed_frames = 0
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def detect(
+        self, frame_bgr: np.ndarray, vehicle_boxes: Optional[List[tuple]] = None
+    ) -> Tuple[np.ndarray, dict]:
+        """Return a lane-only overlay and its source-frame geometry.
+
+        The overlay is black outside the lane polygon. ``draw_overlay`` blends
+        only non-black pixels, so it cannot darken the complete video frame.
+        """
+        height, width = frame_bgr.shape[:2]
+        overlay = np.zeros_like(frame_bgr)
+        features, painted = self._lane_feature_mask(frame_bgr, vehicle_boxes)
+        left_candidates, right_candidates = self._find_candidates(features, painted)
+        best = self._best_pair(left_candidates, right_candidates, height, width)
+
+        left_detected = best is not None
+        right_detected = best is not None
+        tracking = False
+        confidence = 0.0
+
+        if best is not None:
+            left_line, right_line, pair = best
+            confidence = float(pair["confidence"])
+            self._store_pair(left_line, right_line, height, width)
+            # Draw the smoothed pair to prevent visible one-frame jitter.
+            smoothed = self._previous_lines(height, width)
+            if smoothed is not None:
+                left_line, right_line = smoothed
+            pair = self._line_pair(left_line, right_line, height, width)
+            if pair is None:  # Defensive: retain the unsmoothed validated pair.
+                left_line, right_line, pair = best
+        else:
+            self._missed_frames += 1
+            previous = self._previous_lines(height, width)
+            if previous is None or self._missed_frames > self.hold_frames:
+                # Do not invent a lane when the road markings are unavailable.
+                if self._missed_frames > self.hold_frames:
+                    self._left_line_norm = None
+                    self._right_line_norm = None
+                return overlay, {
+                    "left_pts": None,
+                    "right_pts": None,
+                    "vanishing_pt": None,
+                    "corridor_polygon": None,
+                    "left_detected": False,
+                    "right_detected": False,
+                    "tracking": False,
+                    "confidence": 0.0,
+                    "top_y": None,
+                }
+            left_line, right_line = previous
+            pair = self._line_pair(left_line, right_line, height, width)
+            if pair is None:
+                return overlay, {
+                    "left_pts": None,
+                    "right_pts": None,
+                    "vanishing_pt": None,
+                    "corridor_polygon": None,
+                    "left_detected": False,
+                    "right_detected": False,
+                    "tracking": False,
+                    "confidence": 0.0,
+                    "top_y": None,
+                }
+            tracking = True
+            confidence = max(0.0, 0.65 - 0.05 * self._missed_frames)
+
+        y_bottom = int(height * 0.985)
+        # Starting just below the pair's intersection creates a narrow pointed
+        # far end, rather than the large horizontal "floating" cap from the old
+        # fixed BEV trapezoid.
+        y_top = int(np.clip(pair["y_vanish"] + 5, height * 0.50, height * 0.86))
+        left_top = (int(round(left_line.x_at(y_top))), y_top)
+        right_top = (int(round(right_line.x_at(y_top))), y_top)
+        left_bottom = (int(round(left_line.x_at(y_bottom))), y_bottom)
+        right_bottom = (int(round(right_line.x_at(y_bottom))), y_bottom)
+
+        polygon = np.array([left_bottom, left_top, right_top, right_bottom], dtype=np.int32)
+        polygon[:, 0] = np.clip(polygon[:, 0], 0, width - 1)
+        polygon[:, 1] = np.clip(polygon[:, 1], 0, height - 1)
+        cv2.fillPoly(overlay, [polygon], (20, 150, 35), lineType=cv2.LINE_AA)
+        cv2.polylines(overlay, [np.array([left_bottom, left_top], dtype=np.int32)], False, (255, 215, 0), 4, cv2.LINE_AA)
+        cv2.polylines(overlay, [np.array([right_top, right_bottom], dtype=np.int32)], False, (255, 215, 0), 4, cv2.LINE_AA)
+
+        return overlay, {
+            "left_pts": (left_bottom, left_top),
+            "right_pts": (right_bottom, right_top),
+            "vanishing_pt": (int(round(pair["x_vanish"])), int(round(pair["y_vanish"]))),
+            "corridor_polygon": polygon.tolist(),
+            "left_detected": left_detected,
+            "right_detected": right_detected,
+            "tracking": tracking,
+            "confidence": round(confidence, 2),
+            "top_y": y_top,
+        }

@@ -6,6 +6,7 @@ synthetic detections + synthetic depth maps without requiring neural net weights
 
 import sys
 import os
+import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -13,7 +14,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from detector import Detection, REAL_WORLD_HEIGHT_M  # noqa: E402
 from fusion import fuse_detections_with_depth, estimate_focal_length_px  # noqa: E402
 from tracker import CentroidIOUTracker  # noqa: E402
-from visualizer import generate_warnings, risk_level  # noqa: E402
+from lane_detector import LaneDetector  # noqa: E402
+from visualizer import draw_overlay, generate_warnings, risk_level  # noqa: E402
 
 
 def make_detection(class_name, x1, y1, x2, y2, conf=0.9):
@@ -133,6 +135,51 @@ def test_risk_levels():
     assert risk_level(truck_result) == "safe"
 
 
+def test_lane_corridor_follows_markings_and_never_falls_back_to_a_fake_lane():
+    """The lane overlay must be fitted to real paint, not a fixed trapezoid."""
+    h, w = 720, 1280
+    road = np.full((h, w, 3), (75, 75, 75), dtype=np.uint8)
+
+    # A yellow left boundary and white right boundary converge on the road.
+    cv2.line(road, (420, 710), (640, 440), (0, 220, 255), 10, cv2.LINE_AA)
+    cv2.line(road, (860, 710), (640, 440), (245, 245, 245), 10, cv2.LINE_AA)
+
+    detector = LaneDetector(smooth_alpha=1.0, hold_frames=2)
+    overlay, data = detector.detect(road)
+
+    assert data["left_detected"] and data["right_detected"]
+    assert data["corridor_polygon"] is not None
+    assert data["vanishing_pt"][1] >= int(h * 0.58)
+    assert 350 <= data["left_pts"][0][0] <= 500
+    assert 800 <= data["right_pts"][0][0] <= 950
+    assert np.any(overlay), "A valid painted lane should produce an overlay"
+
+    # A new detector must not manufacture a lane on a featureless road.
+    blank = np.full_like(road, 75)
+    cold_overlay, cold_data = LaneDetector().detect(blank)
+    assert not np.any(cold_overlay)
+    assert cold_data["corridor_polygon"] is None
+
+    # A recently valid lane may be held briefly for an occlusion, then clears.
+    held_overlay, held_data = detector.detect(blank)
+    assert np.any(held_overlay) and held_data["tracking"]
+    detector.detect(blank)
+    lost_overlay, lost_data = detector.detect(blank)
+    assert not np.any(lost_overlay)
+    assert lost_data["corridor_polygon"] is None
+
+
+def test_lane_blending_preserves_pixels_outside_the_lane_overlay():
+    """A black lane canvas must not darken the complete camera frame."""
+    frame = np.full((240, 320, 3), (80, 120, 160), dtype=np.uint8)
+    overlay = np.zeros_like(frame)
+    overlay[150:210, 140:180] = (20, 150, 35)
+
+    rendered = draw_overlay(frame, [], lane_overlay=overlay, lane_data={})
+    assert np.array_equal(rendered[100, 100], frame[100, 100])
+    assert not np.array_equal(rendered[180, 160], frame[180, 160])
+
+
 if __name__ == "__main__":
     tests = [
         test_focal_length_sane,
@@ -141,6 +188,8 @@ if __name__ == "__main__":
         test_tracker_assigns_and_persists_ids,
         test_approaching_status_and_warning_triggers,
         test_risk_levels,
+        test_lane_corridor_follows_markings_and_never_falls_back_to_a_fake_lane,
+        test_lane_blending_preserves_pixels_outside_the_lane_overlay,
     ]
     failed = 0
     for t in tests:

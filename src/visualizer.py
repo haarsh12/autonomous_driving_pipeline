@@ -140,8 +140,13 @@ def draw_overlay(frame, objects: List[FusedObject], tracker=None,
     # ── 0. BLEND LANE OVERLAY ────────────────────────────────────────────────
     video = frame.copy()
     if lane_overlay is not None and lane_overlay.shape[:2] == (H, W):
-        # Semi-transparent blend: 0.55 original + 0.45 lane overlay
-        cv2.addWeighted(lane_overlay, 0.45, video, 0.55, 0, dst=video)
+        # ``lane_overlay`` is black outside the fitted road polygon. Blend only
+        # its painted pixels; blending the full frame would darken the sky and
+        # surroundings even when no lane has been detected.
+        lane_pixels = np.any(lane_overlay != 0, axis=2)
+        if np.any(lane_pixels):
+            blended = cv2.addWeighted(video, 0.66, lane_overlay, 0.34, 0)
+            video[lane_pixels] = blended[lane_pixels]
 
     drawn_pills = []
 
@@ -234,7 +239,8 @@ def draw_overlay(frame, objects: List[FusedObject], tracker=None,
     if lane_data:
         ld = lane_data.get("left_detected", False)
         rd = lane_data.get("right_detected", False)
-        lane_status = "LANE: L+R" if (ld and rd) else ("LANE: L only" if ld else ("LANE: R only" if rd else "LANE: --"))
+        tracking = lane_data.get("tracking", False)
+        lane_status = "LANE: L+R" if (ld and rd) else ("LANE: TRACKING" if tracking else "LANE: --")
         lane_col    = C_SAFE if (ld and rd) else C_CAUTION
         _pt(video, lane_status, (8, H - 36), FONT, 0.45, lane_col, 1)
 
